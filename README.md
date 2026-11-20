@@ -94,6 +94,12 @@ and a machine short of free RAM pays for it in reclaim. `GGML_CUDA_MOE_ARENA_MB=
 
 `GGML_CUDA_MOE_ARENA_MB=0` restores the old behavior (Linux; on Windows it is still the default).
 
+On Windows the arena is not built and the driver refuses to register the file's mapping, so the experts stay in the
+page cache by default. `GGML_CUDA_MOE_PIN_DIRECT=1` takes the first case above there: when every expert fits in the
+available RAM less the margin, the experts' file views are read once (unbuffered) into Avalon's own memory at the
+same addresses and registered. It costs the load time of that read (~18 s for 54.6 GiB from an NVMe drive) and the
+RAM, held while the server runs; with less RAM the views stay mapped, as without it.
+
 Measured here with less RAM simulated: the server in a memory cgroup of 14 or 28 GB, and the driver's registration
 limit lowered to the one of a 16 or 32 GB machine (MTP, 32k context, short prompt, 5 answers of 512 tokens per server):
 
