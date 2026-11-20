@@ -1,4 +1,3 @@
-<p align="center"><img src="media/avalon-logo.png" alt="Avalon" width="400"></p>
 
 # AvalonWindows
 
@@ -14,6 +13,7 @@ Contains Windows-specific code paths focusing on doing everything possible to ma
 
 Avalon is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) built for one model, [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) (512 experts, 10 active, 48 layers), on one consumer GPU with the experts in system RAM.
 
+<p align="center"><img src="media/avalon-logo.png" alt="Avalon" width="200"></p>
 
 ## Credits
 
