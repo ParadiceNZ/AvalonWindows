@@ -3176,6 +3176,27 @@ static bool moe_cache_pin_tensor(const moe_cache_session & session, moe_cache_de
         (void) cudaGetLastError();
         err = cudaHostRegister((void *) ib, ie - ib, flags);
     }
+#if defined(_WIN32)
+    // Windows (HIP SDK): the read-only flag, and the mapping into the GPU's address space, may be refused with another
+    // error than NotSupported (build dc6169a on an RX 7800 XT: "0 expert tensors registered", the first range refused).
+    // Tried without them before giving up (without the mapping the dispatcher's kernel copy is not used: its device
+    // pointer is null); the first refusal is logged once with both errors
+    if (err != cudaSuccess) {
+        const cudaError_t first = err;
+        (void) cudaGetLastError();
+        err = cudaHostRegister((void *) ib, ie - ib, flags);
+        if (err != cudaSuccess) {
+            (void) cudaGetLastError();
+            err = cudaHostRegister((void *) ib, ie - ib, cudaHostRegisterPortable);
+        }
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            MOE_CACHE_LOG("[moe-cache] CUDA%d pin: read-only mapped registration refused (%s), without the flags: %s\n",
+                    device.physical, cudaGetErrorString(first), err == cudaSuccess ? "registered" : cudaGetErrorString(err));
+        }
+    }
+#endif
     if (err != cudaSuccess) {
         (void) cudaGetLastError();
         (void) moe_cache_remap_any(device, ib, ie);   // the half-done registration goes with the old mapping
@@ -3313,6 +3334,246 @@ static size_t moe_cache_pin_load_direct(moe_cache_device & device, const std::ve
         });
     }
     return total;
+#elif defined(_WIN32)
+    // Windows (GGML_CUDA_MOE_PIN_DIRECT=1): a model file is one view (llama_mmap maps the whole file), which cannot be
+    // replaced in part as MAP_FIXED does above. A view of experts (the experts' bytes within 1 GiB of the view's: not the
+    // PLE table's file) is replaced whole: its file mapped again for a way back, the view unmapped, private memory
+    // committed at the same address and the file read into it (FILE_FLAG_NO_BUFFERING, GGML_CUDA_MOE_ARENA_READERS
+    // threads, 64 MiB pieces). Same bytes, same addresses: the experts are then the process's own memory, which the
+    // driver can register (it refused the file's pages), and that no other program's file reads evict. Only when the
+    // driver registers private memory at all (a probe of 256 MiB first) and the physical memory available now holds
+    // the views plus GGML_CUDA_MOE_ARENA_MARGIN_MB (4096); views that do not fit stay mapped. Synchronous: left[] at 0
+    // on return, no reader left running. On exit llama_mmap's UnmapViewOfFile of a replaced view warns (harmless).
+    GGML_UNUSED(readers); GGML_UNUSED(mu); GGML_UNUSED(cv);
+    for (size_t i = 0; i < merged.size(); i++) {
+        left[i].store(0);
+        loaded[i] = 1;
+    }
+    if (merged.empty()) {
+        return 0;
+    }
+    {
+        const size_t probe = (size_t) 256 << 20;
+        void * p = VirtualAlloc(nullptr, probe, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        cudaError_t err = cudaErrorUnknown;
+        if (p) {
+            memset(p, 1, probe);
+            err = cudaHostRegister(p, probe, cudaHostRegisterPortable | cudaHostRegisterMapped);
+            if (err != cudaSuccess) {
+                (void) cudaGetLastError();
+                err = cudaHostRegister(p, probe, cudaHostRegisterPortable);
+            }
+            if (err == cudaSuccess) {
+                (void) cudaHostUnregister(p);
+            }
+            (void) cudaGetLastError();
+            VirtualFree(p, 0, MEM_RELEASE);
+        }
+        if (err != cudaSuccess) {
+            MOE_CACHE_LOG("[moe-cache] CUDA%d direct load: the driver registers no private memory either (%s), the views kept\n",
+                    device.physical, p ? cudaGetErrorString(err) : "VirtualAlloc failed");
+            return 0;
+        }
+    }
+    struct view { uintptr_t base; size_t size; size_t experts; std::wstring path; HANDLE file; HANDLE mapping; bool swapped; };
+    std::vector<view> views;
+    for (const auto & r : merged) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery((const void *) r.first, &mbi, sizeof(mbi)) || mbi.Type != MEM_MAPPED) {
+            continue;
+        }
+        const uintptr_t base = (uintptr_t) mbi.AllocationBase;
+        view * v = nullptr;
+        for (auto & x : views) {
+            v = x.base == base ? &x : v;
+        }
+        if (!v) {
+            view nv = { base, 0, 0, L"", INVALID_HANDLE_VALUE, nullptr, false };
+            for (uintptr_t a = base;;) {
+                MEMORY_BASIC_INFORMATION m2;
+                if (!VirtualQuery((const void *) a, &m2, sizeof(m2)) || (uintptr_t) m2.AllocationBase != base || m2.RegionSize == 0) {
+                    break;
+                }
+                a += m2.RegionSize;
+                nv.size = a - base;
+            }
+            views.push_back(nv);
+            v = &views.back();
+        }
+        v->experts += r.second - r.first;
+    }
+    // the file of a view, as a drive path (K32GetMappedFileNameW gives \Device\HarddiskVolumeN\...)
+    using gmfn_t = DWORD (WINAPI *)(HANDLE, LPVOID, LPWSTR, DWORD);
+    static const gmfn_t gmfn = (gmfn_t) (void *) GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32GetMappedFileNameW");
+    const auto dos_path = [](uintptr_t base) -> std::wstring {
+        static wchar_t dev[1024];
+        if (!gmfn || !gmfn(GetCurrentProcess(), (LPVOID) base, dev, 1024)) {
+            return L"";
+        }
+        wchar_t drives[512];
+        const DWORD n = GetLogicalDriveStringsW(511, drives);
+        for (const wchar_t * d = drives; n > 0 && n < 512 && *d; d += wcslen(d) + 1) {
+            const wchar_t name[3] = { d[0], L':', 0 };
+            wchar_t target[1024];
+            if (QueryDosDeviceW(name, target, 1024)) {
+                const size_t len = wcslen(target);
+                if (wcsncmp(dev, target, len) == 0 && dev[len] == L'\\') {
+                    return std::wstring(name) + (dev + len);
+                }
+            }
+        }
+        return L"";
+    };
+    const char * margin_env = getenv("GGML_CUDA_MOE_ARENA_MARGIN_MB");
+    const size_t margin = (margin_env ? (size_t) atoll(margin_env) : 4096) << 20;
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    size_t avail = GlobalMemoryStatusEx(&ms) ? (size_t) ms.ullAvailPhys : 0;
+    avail = avail > margin ? avail - margin : 0;
+    size_t want = 0, skipped_big = 0, skipped_room = 0;
+    std::vector<view *> todo;
+    for (auto & v : views) {
+        if (v.size > v.experts + ((size_t) 1 << 30)) {
+            skipped_big++;
+            continue;
+        }
+        if (want + v.size > avail) {
+            skipped_room++;
+            continue;
+        }
+        v.path = dos_path(v.base);
+        if (v.path.empty()) {
+            continue;
+        }
+        want += v.size;
+        todo.push_back(&v);
+    }
+    const auto restore = [&device](view & v) {
+        // the file's view again at its address (the mapping was prepared before the view was given up)
+        if (MapViewOfFileEx(v.mapping, FILE_MAP_READ, 0, 0, 0, (void *) v.base) != (void *) v.base) {
+            GGML_ABORT("[moe-cache] CUDA%d direct load: the view at %p could not be mapped back (error %lu)", device.physical,
+                    (void *) v.base, (unsigned long) GetLastError());
+        }
+    };
+    const int64_t t0 = ggml_time_us();
+    for (view * v : todo) {
+        v->file = CreateFileW(v->path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        v->mapping = v->file != INVALID_HANDLE_VALUE ? CreateFileMappingW(v->file, nullptr, PAGE_READONLY, 0, 0, nullptr) : nullptr;
+        if (!v->mapping || !UnmapViewOfFile((void *) v->base)) {
+            if (v->mapping) CloseHandle(v->mapping);
+            if (v->file != INVALID_HANDLE_VALUE) CloseHandle(v->file);
+            v->mapping = nullptr;
+            v->file = INVALID_HANDLE_VALUE;
+            continue;
+        }
+        void * p = VirtualAlloc((void *) v->base, v->size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (p != (void *) v->base) {
+            // the commit limit (RAM + page file) reached, or the range taken meanwhile: the file's view back
+            if (p) {
+                VirtualFree(p, 0, MEM_RELEASE);
+            }
+            restore(*v);
+            CloseHandle(v->mapping);
+            CloseHandle(v->file);
+            v->mapping = nullptr;
+            v->file = INVALID_HANDLE_VALUE;
+            MOE_CACHE_LOG("[moe-cache] CUDA%d direct load: %zu MiB at %p not committed (error %lu), its view kept\n",
+                    device.physical, v->size >> 20, (void *) v->base, (unsigned long) GetLastError());
+            continue;
+        }
+        v->swapped = true;
+    }
+    // the reads, 64 MiB pieces of the swapped views, each reader with its own handles (unbuffered: offsets, lengths and
+    // addresses are multiples of the page)
+    struct piece { view * v; size_t off, len; };
+    std::vector<piece> pieces;
+    const size_t piece_bytes = (size_t) 64 << 20;
+    for (view * v : todo) {
+        for (size_t off = 0; v->swapped && off < v->size; off += piece_bytes) {
+            pieces.push_back({ v, off, std::min(piece_bytes, v->size - off) });
+        }
+    }
+    std::vector<char> failed(views.size(), 0);
+    std::atomic<size_t> next{0};
+    std::atomic<size_t> got_total{0};
+    std::mutex fail_mu;
+    const int n_threads = getenv("GGML_CUDA_MOE_ARENA_READERS") ? std::max(1, atoi(getenv("GGML_CUDA_MOE_ARENA_READERS"))) : 8;
+    std::vector<std::thread> team;
+    for (int t = 0; t < n_threads; t++) {
+        team.emplace_back([&] {
+            std::map<view *, HANDLE> handles;
+            for (size_t k; (k = next.fetch_add(1)) < pieces.size();) {
+                const piece & q = pieces[k];
+                HANDLE & h = handles[q.v];
+                if (!h) {
+                    h = CreateFileW(q.v->path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                    if (h == INVALID_HANDLE_VALUE) {
+                        h = CreateFileW(q.v->path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                        nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                    }
+                }
+                bool ok = h != INVALID_HANDLE_VALUE;
+                size_t got = 0;
+                while (ok && got < q.len) {
+                    OVERLAPPED ov = {};
+                    const uint64_t off = q.off + got;
+                    ov.Offset = (DWORD) off;
+                    ov.OffsetHigh = (DWORD) (off >> 32);
+                    const DWORD want = (DWORD) (q.len - got);
+                    DWORD n = 0;
+                    if (!ReadFile(h, (char *) q.v->base + off, want, &n, &ov)) {
+                        ok = GetLastError() == ERROR_HANDLE_EOF;   // past the end: the rest stays zero, as the view had it
+                        break;
+                    }
+                    got += n;
+                    if (n < want) {
+                        // a file returns less only at its end; reading on would start an unbuffered read at that
+                        // misaligned offset, which Windows refuses (19 Nov: 30 of 32 files "failed" so). The view's
+                        // last page past the end stays zero, as it was mapped
+                        break;
+                    }
+                }
+                got_total += got;
+                if (!ok) {
+                    std::lock_guard<std::mutex> lock(fail_mu);
+                    failed[q.v - views.data()] = 1;
+                }
+            }
+            for (auto & e : handles) {
+                if (e.second && e.second != INVALID_HANDLE_VALUE) {
+                    CloseHandle(e.second);
+                }
+            }
+        });
+    }
+    for (auto & t : team) {
+        t.join();
+    }
+    size_t n_ok = 0, bytes_ok = 0;
+    for (view * v : todo) {
+        if (!v->swapped) {
+            continue;
+        }
+        if (failed[v - views.data()]) {
+            VirtualFree((void *) v->base, 0, MEM_RELEASE);
+            restore(*v);
+            MOE_CACHE_LOG("[moe-cache] CUDA%d direct load: a read of %ls failed, its view mapped back\n", device.physical,
+                    v->path.c_str());
+        } else {
+            n_ok++;
+            bytes_ok += v->size;
+        }
+        CloseHandle(v->mapping);
+        CloseHandle(v->file);
+    }
+    const double s = (ggml_time_us() - t0) / 1e6;
+    MOE_CACHE_LOG("[moe-cache] CUDA%d direct load: %zu of %zu views of experts (%zu MiB) read into private memory in %.1f s "
+            "(%.2f GB/s); %zu views mostly not experts, %zu not within the free RAM (%zu MiB less %zu margin)\n",
+            device.physical, n_ok, views.size(), bytes_ok >> 20, s, s > 0 ? got_total.load() / s / 1e9 : 0.0, skipped_big,
+            skipped_room, avail >> 20, margin >> 20);
+    return bytes_ok;
 #else
     GGML_UNUSED(device); GGML_UNUSED(merged); GGML_UNUSED(left); GGML_UNUSED(loaded); GGML_UNUSED(readers);
     GGML_UNUSED(mu); GGML_UNUSED(cv);
@@ -3383,6 +3644,16 @@ static void moe_cache_pin_experts(const moe_cache_session & session, moe_cache_d
             (void) moe_cache_remap_any(device, r.first, r.second);   // a failed read: the file's pages again
             continue;
         }
+#if defined(_WIN32)
+        // the direct load: only the ranges it made private memory can be registered (the driver refuses the file
+        // views' pages); a range left in a view is skipped, not taken for the driver's limit
+        if (device.pin_direct) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery((const void *) r.first, &mbi, sizeof(mbi)) || mbi.Type != MEM_PRIVATE) {
+                continue;
+            }
+        }
+#endif
         moe_cache_seen_tensor whole;
         whole.bytes = r.second - r.first;
         if (!moe_cache_pin_tensor(session, device, (const void *) r.first, whole, bytes)) {
@@ -3423,7 +3694,7 @@ static void moe_cache_pin_experts(const moe_cache_session & session, moe_cache_d
             budget_left_out ? (" (" + std::to_string(budget_left_out) + " over the RAM budget, " +
                 std::to_string(budget_left_bytes >> 20) + " MiB in the page cache)").c_str() : "",
             device.pin_full ? moe_cache_pin_refusal(device).c_str() : "",
-            device.pin_direct ? (" (read with O_DIRECT: " + std::to_string(direct_bytes >> 20) + " MiB)").c_str() : "");
+            device.pin_direct ? (" (read directly: " + std::to_string(direct_bytes >> 20) + " MiB)").c_str() : "");
 }
 
 // The expert arena (moe-arena.h), GGML_CUDA_MOE_ARENA_MB=N: N MiB of anonymous memory
