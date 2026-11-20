@@ -982,6 +982,54 @@ void llama_prefetch(llama_memory_ranges mr) {
     }
     mr.resize(n_ranges);
 #if defined(_WIN32)
+    // Many ranges (a prompt batch's rows of the PLE table: ~260 000 rows of 114 bytes at random in 36.6 GiB for 16k
+    // tokens): threads that each read a byte of every page of their share, so that their page faults wait on the disk
+    // together. PrefetchVirtualMemory brought such pages in at 9 000 - 15 000 a second (60 MB/s, the disk's speed at a
+    // queue depth of one) on a 7800X3D with an NVMe drive, the GPU idle ~6 s before a 16k-token prompt whose rows the
+    // page cache had lost (20 Nov). LLAMA_PREFETCH_THREADS: the threads (32; 0: PrefetchVirtualMemory for every call);
+    // LLAMA_PREFETCH_LOG=1 logs the calls of 1024 ranges or more and their time
+    static const int touch_threads = [] {
+        const char * e = getenv("LLAMA_PREFETCH_THREADS");
+        return e && *e ? std::max(0, atoi(e)) : 32;
+    }();
+    static const bool log_calls = getenv("LLAMA_PREFETCH_LOG") && atoi(getenv("LLAMA_PREFETCH_LOG")) != 0;
+    const int64_t t_prefetch = ggml_time_us();
+    if (touch_threads > 0 && mr.size() >= 256) {
+        const int n_threads = (int) std::min<size_t>((size_t) touch_threads, mr.size() / 64 + 1);
+        std::atomic<size_t> next{0};
+        std::atomic<size_t> pages{0};
+        auto work = [&]() {
+            size_t n_pages = 0;
+            for (;;) {
+                const size_t i0 = next.fetch_add(64);
+                if (i0 >= mr.size()) {
+                    break;
+                }
+                for (size_t i = i0; i < std::min(i0 + 64, mr.size()); i++) {
+                    const char * a = (const char *) mr[i].addr;
+                    for (size_t off = 0; off < mr[i].size; off += page) {
+                        (void) *(const volatile char *) (a + off);   // a volatile read: not left out
+                        n_pages++;
+                    }
+                }
+            }
+            pages += n_pages;
+        };
+        std::vector<std::thread> workers;
+        workers.reserve(n_threads - 1);
+        for (int t = 1; t < n_threads; t++) {
+            workers.emplace_back(work);
+        }
+        work();
+        for (auto & w : workers) {
+            w.join();
+        }
+        if (log_calls && mr.size() >= 1024) {
+            LLAMA_LOG_INFO("llama_prefetch: %zu ranges, %zu pages read by %d threads in %.1f ms\n", mr.size(), pages.load(),
+                    n_threads, (ggml_time_us() - t_prefetch) / 1000.0);
+        }
+        return;
+    }
     // prefetch the merged ranges in one call, so the reads can be issued concurrently
     std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
     entries.reserve(mr.size());
@@ -991,6 +1039,9 @@ void llama_prefetch(llama_memory_ranges mr) {
     if (!entries.empty() && !pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0)) {
         LLAMA_LOG_WARN("llama_prefetch: PrefetchVirtualMemory failed: %s\n",
                 llama_format_win_err(GetLastError()).c_str());
+    }
+    if (log_calls && mr.size() >= 1024) {
+        LLAMA_LOG_INFO("llama_prefetch: %zu ranges by PrefetchVirtualMemory in %.1f ms\n", mr.size(), (ggml_time_us() - t_prefetch) / 1000.0);
     }
 #else
     for (const auto & range : mr) {
