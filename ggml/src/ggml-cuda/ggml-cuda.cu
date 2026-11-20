@@ -3608,6 +3608,14 @@ static void ggml_cuda_host_bounce_wait(cudaEvent_t event) {
 bool ggml_cuda_host_copy_bounce(char * dst, size_t dpitch, const char * src, size_t spitch,
                                 size_t width, size_t height, void * stream_v) {
     cudaStream_t stream = (cudaStream_t) stream_v;
+    // GGML_CUDA_HOST_BOUNCE=0: none, the copies by cudaMemcpyAsync as before fe87a8d. On an RX 7800 XT under Windows,
+    // where every expert of a prompt is copied from the mapping, the bounce buffer's memcpy and kernels read prompts at
+    // 1213 t/s (16k tokens) and 1385 (100k) against 1708 and 1834 without it, the replies and the MTP draft's acceptance
+    // the same; the SDMA ring that the bounce buffer avoids never held a copy there
+    static const bool off = getenv("GGML_CUDA_HOST_BOUNCE") && atoi(getenv("GGML_CUDA_HOST_BOUNCE")) == 0;
+    if (off) {
+        return false;
+    }
     if (width == 0 || height == 0 || width * height <= ggml_cuda_host_copy_kernel_min ||
         !ggml_cuda_host_ptr_pageable(src)) {
         return false;
