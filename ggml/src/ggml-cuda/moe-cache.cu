@@ -10977,6 +10977,68 @@ static double moe_cache_pcie_bytes_per_us(int physical, std::string & desc) {
 #endif
 }
 
+// The copy rate of the path an expert takes to the card, measured (not Linux: the link's capabilities are not readable
+// there, and the preload's rate is the disk's on a cold start: 2.37 GB/s "measured" for a PCIe 4.0 x16 RX 7800 XT under
+// Windows, which made the scheduler host prompt blocks of up to 8191 rows on the CPU). 64 MiB of an expert tensor's host
+// memory (a registered range if there is one: the fills' path) copied to the card 4 times after a warm-up, timed on the
+// host, the staging ring's memcpy included when the experts are not registered. Once, outside any capture, at the first
+// hosted block. GGML_CUDA_MOE_PCIE_BENCH=0: the preload's rate, as before
+static void moe_cache_pcie_bench(moe_hosted_state * st, moe_cache_device & device, cudaStream_t stream) {
+#if defined(__linux__)
+    GGML_UNUSED(st); GGML_UNUSED(device); GGML_UNUSED(stream);
+#else
+    static const bool on = !getenv("GGML_CUDA_MOE_PCIE_BENCH") || atoi(getenv("GGML_CUDA_MOE_PCIE_BENCH")) != 0;
+    if (!on) {
+        return;
+    }
+    const size_t bytes = (size_t) 64 << 20;
+    const char * src = nullptr;
+    bool registered = false;
+    {
+        std::lock_guard<std::mutex> lock(st->session->mu);
+        for (const auto & r : device.pinned) {
+            if (r.second - r.first >= bytes) {
+                src = (const char *) r.first;
+                registered = true;
+                break;
+            }
+        }
+        for (const auto & t : device.seen_tensors) {
+            if (!src && t.second.bytes >= bytes) {
+                src = (const char *) t.first;
+            }
+        }
+    }
+    if (!src) {
+        return;
+    }
+    char * dst = nullptr;
+    if (cudaMalloc((void **) &dst, bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+    const int reps = 4;
+    bool ok = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+              cudaStreamSynchronize(stream) == cudaSuccess;   // warm: the pages, the ring
+    const int64_t t0 = ggml_time_us();
+    for (int i = 0; ok && i < reps; i++) {
+        ok = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream) == cudaSuccess;
+    }
+    ok = ok && cudaStreamSynchronize(stream) == cudaSuccess;
+    const int64_t us = ggml_time_us() - t0;
+    (void) cudaGetLastError();
+    cudaFree(dst);
+    if (!ok || us <= 0) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d PCIe: the copy bench failed, %.2f GB/s kept\n", device.physical, st->pcie_bytes_per_us / 1000.0);
+        return;
+    }
+    const double rate = (double) bytes * reps / (double) us;
+    MOE_CACHE_LOG("[moe-cache] CUDA%d PCIe: %.2f GB/s measured by copies of %zu MiB of %s experts (was %.2f GB/s), taken\n",
+            device.physical, rate / 1000.0, bytes >> 20, registered ? "registered" : "pageable", st->pcie_bytes_per_us / 1000.0);
+    st->pcie_bytes_per_us = rate;
+#endif
+}
+
 // the copy rate of a card's link, bytes per microsecond: the preload's (GiB of experts copied from host memory at start,
 // measured once, already done: the link as it is, a slot or a host that halves it included), else the link's
 // capabilities (moe_cache_pcie_bytes_per_us) when they are known and the measure is not well below them. GGML_CUDA_MOE_PCIE_MEASURED=0: the
@@ -12335,6 +12397,7 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     if (!st->gpu_benched) {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         if (cudaStreamIsCapturing(ctx.stream(), &capture) == cudaSuccess && capture == cudaStreamCaptureStatusNone) {
+            moe_cache_pcie_bench(st, *device, ctx.stream());
             moe_split_gpu_bench(st, *device, layer, gate->src[0]->type, down->src[0]->type, ctx.stream());
         }
         (void) cudaGetLastError();
