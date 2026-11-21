@@ -7,6 +7,33 @@ Contains Windows-specific code paths focusing on doing everything possible to ma
 
 (coming soon: a table showing a comparison to current upstream Avalon builds)
 
+## Results
+
+Comparing Avalon's base recommendations (from Avalon README), on an RX 7800 XT 16GB, Ryzen 7 7800X3D, 96GB DDR5.
+Greedy decoding, 512 tokens, MTP with 2 draft tokens, the median of 3 rounds (the short-prompt case: of 3 x 4 prompts).
+
+### Generation, tokens per second (t/s), with MTP 2-draft tokens - higher is better 
+
+| case | Avalon | AvalonWindows | AvalonWindows + recommended settings |
+|---|---|---|---|
+| 32k context, short prompt, warm cache | 77.0 | 83.7  | 82.7  |
+| 32k context, 32k filled | 73.8 | 72.3  | 71.7  |
+| 256k context, 131k filled | 64.7 | 67.2  | 67.3  |
+| 256k context, 250k filled | 57.8 | 57.3  | 60.4  |
+
+### Prompt reading speed (t/s) - higher is better
+
+| case | Avalon | AvalonWindows | AvalonWindows + recommended settings |
+|---|---|---|---|
+| 32k context, 32k filled | 1,107 | 1,107  | 1,915  |
+| 256k context, 131k filled | 1,057 | 1,061  | 1,827  |
+| 256k context, 250k filled | 1,076 | 1,076  | 1,811
+
+### Specific benchmarked versions:
+- Avalon (base commit 0019bc940 + issue #69 fix, 2026-11-20).
+- AvalonWindows: commit 32b58de4a (2026-11-22)
+- For 'recommended settings' see example optimised launch batch file below.
+
 
 ## How to compile on Windows (AMD GPU, HIP)
 
