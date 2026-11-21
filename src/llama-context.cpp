@@ -2061,6 +2061,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const bool small = !cparams.pipeline_parallel && ubatch.n_tokens <= LLAMA_GRAPH_SMALL_MAX_TOKENS;
     auto * res = small ? get_gf_res_small(ubatch) : get_gf_res_prev();
+    ggml_backend_sched_set_small(sched.get(), small);
     auto * gf  = res->get_gf();
 
     // the new graph parameters
@@ -3746,7 +3747,9 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 }
 
 llm_graph_result * llama_context::get_gf_res_small(const llama_ubatch & ubatch) {
-    const uint32_t key = ubatch.n_tokens * 2 + (n_outputs > 0);
+    // the exact output count: a verification of 4 tokens (4 outputs) and a prompt's last 4 tokens (1 output) shared a
+    // place, each rebuilding (and recapturing) the other at every request
+    const uint32_t key = ubatch.n_tokens * (LLAMA_GRAPH_SMALL_MAX_TOKENS + 1) + (uint32_t) std::min<int64_t>(n_outputs, LLAMA_GRAPH_SMALL_MAX_TOKENS);
     for (size_t i = 0; i < gf_res_small.size(); i++) {
         if (gf_res_small[i].first == key) {
             std::rotate(gf_res_small.begin(), gf_res_small.begin() + i, gf_res_small.begin() + i + 1);
@@ -6298,6 +6301,10 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+bool llama_moe_cpu_counts(uint64_t * rows, uint64_t * experts, uint64_t * later) {
+    return ggml_backend_moe_cache_cpu_counts(rows, experts, later);
 }
 
 llama_memory_report llama_get_memory_report(const struct llama_context * ctx) {

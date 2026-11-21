@@ -56,6 +56,7 @@
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
 #include "ggml-cuda/qsa-select.cuh"
+#include "ggml-cuda/qsa-decode.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
@@ -1020,6 +1021,8 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    // GGML_CUDA_DRAFT_HEAD_SCREEN: the screening copy of a head in this buffer (mmvq.cu)
+    ggml_cuda_head_screen_release(ctx->dev_ptr, buffer->size);
     delete ctx;
 }
 
@@ -3446,6 +3449,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_QSA_SELECT:
             ggml_cuda_op_qsa_select(ctx, dst);
+            break;
+        case GGML_OP_QSA_DECODE:
+            ggml_cuda_op_qsa_decode(ctx, dst);
             break;
         default:
             return false;
@@ -5943,14 +5949,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // the attention output rotated back and gated: by the flash attention's combination when it has one
-    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+    if (node->op == GGML_OP_FLASH_ATTN_EXT || node->op == GGML_OP_QSA_DECODE) {
         fwht_gate_args ga;
         int64_t n_rows = 0;
         const int last = ggml_cuda_fwht_gate_after_fattn(*cuda_ctx, cgraph, i, &ga, &n_rows);
         if (last > 0) {
             cuda_ctx->fattn_gate      = &ga;
             cuda_ctx->fattn_gate_done = false;
-            ggml_cuda_flash_attn_ext(*cuda_ctx, node);
+            if (node->op == GGML_OP_QSA_DECODE) {
+                ggml_cuda_op_qsa_decode(*cuda_ctx, node);   // its flash attention combines with the gate
+            } else {
+                ggml_cuda_flash_attn_ext(*cuda_ctx, node);
+            }
             cuda_ctx->fattn_gate = nullptr;
             if (!cuda_ctx->fattn_gate_done) {
                 ggml_cuda_fwht_gate_launch((const float *) node->data, n_rows, ga, cuda_ctx->stream());
@@ -9732,6 +9742,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
         case GGML_OP_QSA_SELECT:
             return true;
+        case GGML_OP_QSA_DECODE:
+            return ggml_cuda_qsa_decode_supported(op);
 
         default:
             return false;
@@ -9895,10 +9907,22 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
-// see ggml_backend_cuda_context::nt_weights
+// GGML_CUDA_DRAFT_HEAD_SCREEN: the 2-bit screening copy of an MTP draft's cut LM head, built when the model is loaded
+// (llama, for a head with d2t); false when the variable is off or the head does not qualify (mmvq.cu)
+static bool ggml_backend_cuda_head_screen_prepare(const ggml_tensor * w) {
+    if (w == nullptr || w->buffer == nullptr || !ggml_backend_buffer_is_cuda(w->buffer)) {
+        return false;
+    }
+    const ggml_backend_cuda_buffer_context * buf_ctx = (const ggml_backend_cuda_buffer_context *) w->buffer->context;
+    return ggml_cuda_head_screen_prepare(w, buf_ctx->device);
+}
+
+// see ggml_backend_cuda_context::nt_weights; GGML_CUDA_NT_WEIGHTS=0: normal loads (with GGML_CUDA_MOE_MALL_PREFETCH: in
+// case a non-temporal load, MALL NOALLOC on gfx11, does not hit what the merge's warm-up left in the infinity cache)
 static void ggml_backend_cuda_set_weights_read_once(ggml_backend_t backend, bool read_once) {
+    static const bool nt_on = !getenv("GGML_CUDA_NT_WEIGHTS") || atoi(getenv("GGML_CUDA_NT_WEIGHTS")) != 0;
     if (backend && ggml_backend_is_cuda(backend)) {
-        ((ggml_backend_cuda_context *) backend->context)->nt_weights = read_once;
+        ((ggml_backend_cuda_context *) backend->context)->nt_weights = read_once && nt_on;
     }
 }
 
@@ -9924,6 +9948,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_set_weights_read_once") == 0) {
         return (void *)ggml_backend_cuda_set_weights_read_once;
+    }
+    if (strcmp(name, "ggml_backend_cuda_head_screen_prepare") == 0) {
+        return (void *)ggml_backend_cuda_head_screen_prepare;
     }
     if (strcmp(name, "ggml_backend_set_tensors_async") == 0) {
         return (void *)ggml_backend_cuda_set_tensors_async;
