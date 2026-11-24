@@ -3209,16 +3209,21 @@ static bool moe_cache_pin_tensor(const moe_cache_session & session, moe_cache_de
     return true;
 }
 
-// The experts' anonymous host memory (the direct load's ranges, the arena) in 2 MiB pages where the kernel allows them
-// (transparent huge pages, "madvise" on common distributions): the CPU computes the experts the cache misses from it,
-// rows spread over ~2 MiB per expert; with 4 KiB pages the address translation cost ~6 % of their time (moe-cpu-bench
-// HUGE=1, cold experts). On the server (18 Nov., ABBA): the CPU time per expert row -2.0 % (59.4 -> 58.2 us, ~0.5 % of
-// a step); the first prompt after a start can be slower when the kernel had to compact memory for the 2 MiB pages and
-// evicted part of the page cache (the PLE table: ~4 GiB, read back by that prompt; one start in two here), the
-// following prompts as fast as with 4 KiB pages. GGML_CUDA_MOE_HUGE=0: 4 KiB pages.
+// GGML_CUDA_MOE_HUGE=1: the experts' anonymous host memory (the direct load's ranges, the arena) in 2 MiB pages where
+// the kernel allows them (transparent huge pages, "madvise" on common distributions): the CPU computes the experts the
+// cache misses from it, rows spread over ~2 MiB per expert; with 4 KiB pages the address translation cost ~6 % of their
+// time (moe-cpu-bench HUGE=1, cold experts). On the server (18 Nov., ABBA): the CPU time per expert row -2.0 % (59.4 ->
+// 58.2 us, ~0.5 % of a step).
+// Off by default: the kernel compacts memory to build those pages, and it moves pages of the memory registered for the
+// GPU's copies; each move invalidates a registered range, and KFD suspends the GPU's queues while it restores it
+// (svm_range_restore_work, amdgpu_amdkfd_restore_userptr_worker: "hogged CPU" in the kernel log). RX 7900 XT, Ubuntu
+// 26.04, kernel 7.0.0-44, 24 Nov., replay after 19k: with 2 MiB pages 250 000 - 794 000 pages moved per run, 4 runs
+// in 6 hung (steps of 0.4 s to minutes); with 4 KiB pages 17 000 - 79 000, 3 runs in 3 to their end (one copy of
+// 151 ms). The same workers stalled the GPU on kernel 7.0.0-34 (0.2 s to minutes, 23 Nov.), not measured there with
+// 4 KiB pages.
 static void moe_cache_host_huge_pages(void * p, size_t bytes) {
 #if defined(__linux__) && defined(MADV_HUGEPAGE)
-    static const bool huge = !getenv("GGML_CUDA_MOE_HUGE") || atoi(getenv("GGML_CUDA_MOE_HUGE")) != 0;
+    static const bool huge = getenv("GGML_CUDA_MOE_HUGE") && atoi(getenv("GGML_CUDA_MOE_HUGE")) != 0;
     if (huge && madvise(p, bytes, MADV_HUGEPAGE) != 0) {
         MOE_CACHE_LOG("[moe-cache] madvise(MADV_HUGEPAGE) of %zu MiB failed: %s\n", bytes >> 20, strerror(errno));
     }
@@ -8014,6 +8019,16 @@ static void moe_cache_restore(void * opaque, void * backend) {
     }
     if (restored) {
         device->zone_restores++;
+        // The zones come back in a graph that does not prefetch: the first of the answer. Armed here, the restoration
+        // starts at this graph's first hosted layer; armed at the next graph's start (moe_cache_session_enter_impl, which
+        // still saw the zones out at this one's), it started a pass late: 85 ms after a 131k prompt, the coldest pass
+        // computed with nothing copying (22 Nov.). A prompt chunk that neither prefetches nor is hosted starts nothing, and
+        // the next loan disarms it. GGML_CUDA_MOE_REWARM_EARLY=0: as before
+        static const bool early = !(getenv("GGML_CUDA_MOE_REWARM_EARLY") && atoi(getenv("GGML_CUDA_MOE_REWARM_EARLY")) == 0);
+        if (early && session->lent_since_evictions && !session->lent_in_last_graph) {
+            session->lent_since_evictions = false;
+            device->rewarm_armed = true;
+        }
     }
 }
 
@@ -11246,6 +11261,17 @@ static std::atomic<int>        g_srv_waiters{0};
 static std::mutex              g_srv_mu;
 static std::condition_variable g_srv_cv;
 
+// The threads that serve a hosted layer only when the graph's own thread is busy (a launch, a driver call) compute a few
+// CPU rows with their own OpenMP team: its workers then spun for 200 ms (KMP_BLOCKTIME) on the cores of the team that
+// computes the others. After a 131k prompt (RX 7900 XT, 22 Nov.): 7 more threads at 70 % for 0.8 - 1.5 s, the CPU rows
+// at 105 - 150 us instead of 55. GGML_CUDA_MOE_SERVER_TEAM_ACTIVE=1: as before
+static void moe_hosted_team_passive() {
+    static const bool active = getenv("GGML_CUDA_MOE_SERVER_TEAM_ACTIVE") && atoi(getenv("GGML_CUDA_MOE_SERVER_TEAM_ACTIVE")) != 0;
+    if (!active && ggml_moe_cache.cpu_team_passive) {
+        ggml_moe_cache.cpu_team_passive();
+    }
+}
+
 static void moe_hosted_server_loop() {
     constexpr int max_states = 8;
     for (;;) {
@@ -11597,6 +11623,7 @@ static int moe_hosted_default_threads() {
 // for the stream serves it too (ggml_cuda_moe_hosted_wait): whoever holds serve_mu serves, the other one counts it
 static void moe_hosted_server(moe_hosted_state * st) {
     ggml_cuda_set_device(st->device->logical);
+    moe_hosted_team_passive();
     uint32_t seen;
     {
         std::lock_guard<std::mutex> lock(st->serve_mu);
