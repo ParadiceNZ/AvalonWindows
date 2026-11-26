@@ -5,7 +5,10 @@
 #include "../../ggml/src/ggml-backend-moe-cache.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
+#include <future>
+#include <mutex>
 
 // Small token batches (generation, an MTP verification): the token embedding rows gathered and dequantized by the host
 // into an f32 input instead of a get_rows node of the CPU backend (the table stays in RAM), and the PLE rows read by the
@@ -320,6 +323,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+        ahead = make_ple_ahead();
     }
 
     auto load_block = [&](int il, int flags) {
@@ -2091,6 +2095,112 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
 //   mixed_n = (t[p]*m[0]) ^ ... ^ (t[p-n+1]*m[n-1]);  row = mixed_n % vocab[h] + offset[h]
 // The hash runs host-side because ggml has no int64 and no xor. EOS resets the window.
 
+// the rows of one token: ctx[0] the token, ctx[s] its predecessor s positions back, the EOS rule already applied
+static void qwen4exp_ple_rows(const llama_hparams & hparams, const int64_t * ctx, int32_t * rows) {
+    const int64_t n_gram   = hparams.ple_ngram_size;
+    const int64_t per_gram = hparams.ple_heads_per_ngram;
+    for (int64_t n = 2; n <= n_gram; ++n) {
+        uint64_t mixed = (uint64_t) ctx[0] * hparams.ple_layer_multipliers[0];
+        for (int64_t j = 1; j < n; ++j) {
+            mixed ^= (uint64_t) ctx[j] * hparams.ple_layer_multipliers[j];
+        }
+        const int64_t base = (n - 2) * per_gram;
+        for (int64_t g = 0; g < per_gram; ++g) {
+            const int64_t h_i = base + g;
+            rows[h_i] = (int32_t) (mixed % hparams.ple_head_vocab_sizes[h_i] + hparams.ple_head_offsets[h_i]);
+        }
+    }
+}
+
+// LLAMA_PLE_AHEAD=1 (off by default): the PLE rows of the tokens that follow the running prompt ubatch (the rest of its
+// batch, then what the caller announced with llama_tokens_ahead) are read ahead by a thread while that ubatch computes.
+// A prompt ubatch fetches its own rows before its launch, the GPU idle: 0.3 - 0.9 s for 14k tokens of new text with the
+// table mapped, 1.5 - 3 s once the page cache has lost the rows (Windows; Linux when the table and the experts do not
+// fit in RAM together). With its rows read ahead a ubatch takes what it takes on text read before: a new 100k prompt in
+// 49.0 s, not 52.4 (7 batches, a 7800 XT, 26 Nov). The thread starts once the running ubatch has its rows (set_input),
+// so the two reads do not share the disk's queue (except on Linux for a large batch, whose rows the gather's threads
+// advise later: there they overlap). The idea is Lucebox's prompt loop, which gathers the next chunk's inputs on a
+// worker (qwen4exp_backend.cpp; Apache-2.0, no code taken). Reads only: the same rows either way.
+// LLAMA_PREFETCH_LOG=1 logs each read, and a read given up
+struct llama_model_qwen4exp::ple_ahead {
+    std::mutex mutex;
+    std::vector<llama_token> tokens;   // announced, not read yet
+    std::vector<llama_token> prev;     // the tokens before them, oldest first
+    std::future<void> work;
+
+    ~ple_ahead() {
+        if (work.valid()) {
+            work.wait();   // the thread reads the model's mapping
+        }
+    }
+
+    void start(const llama_model & model) {
+        static const bool log_calls = getenv("LLAMA_PREFETCH_LOG") && atoi(getenv("LLAMA_PREFETCH_LOG")) != 0;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (tokens.empty()) {
+            return;
+        }
+        if (work.valid() && work.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            // the read before this one is not over (a slow disk): given up, the ubatch reads its own
+            if (log_calls) {
+                LLAMA_LOG_INFO("ple_ahead: the read before is not over, the next %zu tokens are not read ahead\n", tokens.size());
+            }
+            tokens.clear();
+            return;
+        }
+        work = std::async(std::launch::async, [&model, tok = std::move(tokens), prv = std::move(prev)]() {
+            const auto & hparams = model.hparams;
+            const int64_t n       = (int64_t) tok.size();
+            const int64_t n_prv   = (int64_t) prv.size();
+            const int64_t n_gram  = hparams.ple_ngram_size;
+            const int64_t n_heads = hparams.ple_n_heads;
+            const int64_t eos     = hparams.ple_eos_token_id;
+            const llama_token img_tok = hparams.ple_image_token_id != 0
+                ? (llama_token) hparams.ple_image_token_id
+                : (llama_token) hparams.ple_eos_token_id;
+            const int64_t t0 = ggml_time_us();
+            std::vector<int32_t> idx(n_heads * n);
+            std::vector<int64_t> ctx(n_gram);
+            for (int64_t i = 0; i < n; ++i) {
+                // as set_input(): a missing predecessor or an EOS cuts the window
+                ctx[0] = tok[i] < 0 ? img_tok : tok[i];
+                bool cut = false;
+                for (int64_t s = 1; s < n_gram; ++s) {
+                    const int64_t j = i - s;
+                    const llama_token t = cut ? LLAMA_TOKEN_NULL : j >= 0 ? tok[j] : n_prv + j >= 0 ? prv[n_prv + j] : LLAMA_TOKEN_NULL;
+                    cut = cut || t < 0 || t == eos;
+                    ctx[s] = cut ? eos : t;
+                }
+                qwen4exp_ple_rows(hparams, ctx.data(), idx.data() + i * n_heads);
+            }
+            llama_prefetch_rows(model.per_layer_tok_embd, idx.data(), idx.size());
+            if (log_calls) {
+                LLAMA_LOG_INFO("ple_ahead: the PLE rows of the next %lld tokens read ahead in %.1f ms\n", (long long) n, (ggml_time_us() - t0) / 1000.0);
+            }
+        });
+        tokens.clear();
+        prev.clear();
+    }
+};
+
+std::shared_ptr<llama_model_qwen4exp::ple_ahead> llama_model_qwen4exp::make_ple_ahead() {
+    return std::make_shared<ple_ahead>();
+}
+
+void llama_model_qwen4exp::tokens_ahead(const llama_token * tokens, int64_t n_tokens, const llama_token * prev, int64_t n_prev) const {
+    if (!ahead) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ahead->mutex);
+    ahead->tokens.clear();
+    ahead->prev.clear();
+    // nothing to read ahead once the table is in RAM (llama_mmap::make_resident)
+    if (n_tokens > 0 && per_layer_tok_embd && can_prefetch.count(per_layer_tok_embd)) {
+        ahead->tokens.assign(tokens, tokens + n_tokens);
+        ahead->prev.assign(prev, prev + std::max<int64_t>(n_prev, 0));
+    }
+}
+
 class llm_graph_input_qwen4exp_ple : public llm_graph_input_i {
 public:
     llm_graph_input_qwen4exp_ple(const llama_model & model,
@@ -2141,7 +2251,6 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t n_gram   = hparams.ple_ngram_size;
     const int64_t n_heads  = hparams.ple_n_heads;
-    const int64_t per_gram = hparams.ple_heads_per_ngram;
     const int64_t eos      = hparams.ple_eos_token_id;
     const int64_t n_prev   = n_gram - 1;
 
@@ -2171,18 +2280,7 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
             ctx[s] = cut ? eos : t;
         }
 
-        for (int64_t n = 2; n <= n_gram; ++n) {
-            uint64_t mixed = (uint64_t) ctx[0] * hparams.ple_layer_multipliers[0];
-            for (int64_t j = 1; j < n; ++j) {
-                mixed ^= (uint64_t) ctx[j] * hparams.ple_layer_multipliers[j];
-            }
-            const int64_t base = (n - 2) * per_gram;
-            for (int64_t g = 0; g < per_gram; ++g) {
-                const int64_t h_i = base + g;
-                idx[i * n_heads + h_i] =
-                    (int32_t) (mixed % hparams.ple_head_vocab_sizes[h_i] + hparams.ple_head_offsets[h_i]);
-            }
-        }
+        qwen4exp_ple_rows(hparams, ctx.data(), idx.data() + i * n_heads);
     }
 
     if (host_out) {
@@ -2204,6 +2302,10 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         const bool prefetch = model.can_prefetch.count(ple) && !(by_threads && idx.size() >= 65536);
         if (prefetch) {
             llama_prefetch_rows(ple, idx.data(), idx.size());
+        }
+        // LLAMA_PLE_AHEAD: this ubatch has its rows, the next tokens' are read while it computes
+        if (const auto & ahead = static_cast<const llama_model_qwen4exp &>(model).ahead) {
+            ahead->start(model);
         }
     }
 

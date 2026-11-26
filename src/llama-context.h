@@ -119,6 +119,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     uint32_t reserve_outputs(int32_t n_outputs) { return output_reserve(n_outputs); }   // llama_output_reserve
     void set_nextn_rows_cb(llama_nextn_rows_cb cb, void * user);
+    void set_tokens_ahead(const llama_token * tokens, int32_t n_tokens) { tokens_ahead_next.assign(tokens, tokens + (n_tokens > 0 ? n_tokens : 0)); }   // llama_tokens_ahead
     bool set_mtp_h_rows(const ggml_tensor * rows, int64_t n_rows, ggml_backend_t backend, const float * row_first);
     bool set_mtp_h_rows_ev(const ggml_tensor * rows, int64_t n_rows, ggml_backend_t backend, const float * row_first,
             ggml_backend_event_t ev_ready);
@@ -422,6 +423,11 @@ private:
     // tokens of the decode call still to come after the current ubatch: the KV rows they will need are taken from the MoE
     // expert cache with the current ubatch's (process_ubatch)
     int64_t kv_rows_ahead = 0;
+
+    // LLAMA_PLE_AHEAD: what the caller decodes after the next decode's batch (llama_tokens_ahead); each ubatch of a prompt
+    // batch tells the model the tokens that follow it, the rest of the batch then these (tokens_ahead)
+    std::vector<llama_token> tokens_ahead_next;
+    void tokens_ahead(int64_t n_tokens_prev, const llama_ubatch & ubatch);
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

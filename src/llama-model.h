@@ -809,6 +809,13 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
+    // a hint: the tokens decoded after the ubatch about to run (prev: the ones before them, oldest first); a model may
+    // read ahead what it gathers for them from the disk (qwen4exp's PLE rows). No tokens: none are known, and the hint
+    // before this one no longer holds. No effect on the results
+    virtual void tokens_ahead(const llama_token * tokens, int64_t n_tokens, const llama_token * prev, int64_t n_prev) const {
+        GGML_UNUSED(tokens); GGML_UNUSED(n_tokens); GGML_UNUSED(prev); GGML_UNUSED(n_prev);
+    }
+
 protected:
     llama_model_params params;
 

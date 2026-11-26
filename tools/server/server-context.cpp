@@ -4365,6 +4365,22 @@ private:
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
 
+                    // the prompt's tokens after this batch (one ubatch of them at most), told to the model: with
+                    // LLAMA_PLE_AHEAD=1 it reads ahead what it gathers for them from the disk while the batch computes
+                    if (params_base.n_parallel == 1 && n_tokens_cur > 0 && slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                        const int32_t n_next = std::min<int32_t>(std::min(n_batch, n_ubatch), slot.task->n_tokens() - slot.prompt.n_tokens());
+                        std::vector<llama_token> next;
+                        next.reserve(n_next);
+                        for (int32_t i = 0; i < n_next; i++) {
+                            const llama_token tok = input_tokens[slot.prompt.n_tokens() + i];
+                            if (tok == LLAMA_TOKEN_NULL) {
+                                break; // end of text chunk
+                            }
+                            next.push_back(tok);
+                        }
+                        llama_tokens_ahead(ctx_tgt, next.data(), (int32_t) next.size());
+                    }
+
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
