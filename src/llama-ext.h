@@ -125,6 +125,12 @@ LLAMA_API llama_memory_report llama_get_memory_report(const struct llama_context
 // batch adds). Relaxed atomic reads: cheap enough for every step. false without an expert cache.
 LLAMA_API bool llama_moe_cpu_counts(uint64_t * rows, uint64_t * experts, uint64_t * later);
 
+// A hint for the next decode of ctx (a prompt batch of one sequence): the tokens the caller decodes after that batch, in
+// order. With LLAMA_PLE_AHEAD=1 the model reads ahead what it gathers for them from the disk (qwen4exp's PLE rows) while
+// the batch computes; the tokens after each ubatch inside the batch need no hint. Serves that one decode, no effect on
+// the results.
+LLAMA_API void llama_tokens_ahead(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

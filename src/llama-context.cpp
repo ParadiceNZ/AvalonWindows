@@ -2496,6 +2496,39 @@ uint32_t llama_context::ubatch_reserved() const {
     return llama_stage_full_ubatch_from() && stage_ub_full > cparams.n_ubatch ? stage_ub_full : cparams.n_ubatch;
 }
 
+// LLAMA_PLE_AHEAD=1 (off by default): before a prompt ubatch runs, the model is told the tokens that follow it, one
+// ubatch of them at most: the rest of the batch, then what the caller announced for after it (llama_tokens_ahead).
+// qwen4exp reads their PLE rows ahead while the ubatch computes (llama_model_qwen4exp::ple_ahead). Every other ubatch
+// tells it that none follow: a hint that no ubatch used (a decode that failed) does not serve a later one
+void llama_context::tokens_ahead(int64_t n_tokens_prev, const llama_ubatch & ubatch) {
+    static const bool on = getenv("LLAMA_PLE_AHEAD") && atoi(getenv("LLAMA_PLE_AHEAD")) != 0;
+    if (!on) {
+        return;
+    }
+    const llama_batch & b = balloc->get_batch();
+    const int64_t n_all  = b.n_tokens;
+    const int64_t n_done = n_tokens_prev + ubatch.n_tokens;
+    // a batch of tokens of one sequence cut in order (a prompt): the ubatch is the batch's rows [n_tokens_prev, n_done).
+    // Not a pipeline's: its first stage sets the model's inputs, a ubatch ahead of this one
+    const bool prompt = !stage_first && n_all > 64 && b.token && !b.embd && ubatch.token && ubatch.n_tokens > 0 &&
+        ubatch.n_seqs_unq == 1 && n_done <= n_all &&
+        ubatch.token[0] == b.token[n_tokens_prev] && ubatch.token[ubatch.n_tokens - 1] == b.token[n_done - 1];
+    std::vector<llama_token> next;
+    if (prompt) {
+        const size_t n_max = cparams.n_ubatch;
+        next.reserve(std::min<size_t>(n_max, (size_t) (n_all - n_done) + tokens_ahead_next.size()));
+        for (int64_t i = n_done; i < n_all && next.size() < n_max; i++) {
+            next.push_back(b.token[i]);
+        }
+        for (size_t i = 0; i < tokens_ahead_next.size() && next.size() < n_max; i++) {
+            next.push_back(tokens_ahead_next[i]);
+        }
+    }
+    // the tokens before them: the end of what the batch holds up to there (a few are enough for an n-gram)
+    const int64_t n_prev = next.empty() ? 0 : std::min<int64_t>(n_done, 8);
+    model.tokens_ahead(next.data(), (int64_t) next.size(), n_prev > 0 ? b.token + n_done - n_prev : nullptr, n_prev);
+}
+
 bool llama_context::stage_buffers(uint32_t n_rows) {
     // a prefill's: the whole ubatch, taken from the MoE caches (the compute buffers' types: borrowed while a cache lends
     // them); else a few rows. Each is 2 x 372 MiB at -ub 9536: kept for good, it took that much from each device's cache,
@@ -2601,6 +2634,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             c.mtp_h_src = {};
         }
     } mtp_h_guard { *this };
+    // the tokens announced for after this batch (llama_tokens_ahead) serve this decode only
+    struct ahead_clear {
+        llama_context & c;
+        ~ahead_clear() {
+            c.tokens_ahead_next.clear();
+        }
+    } ahead_guard { *this };
     if ((mtp_h_src.src || mtp_h_src.host) && (batch_inp.n_embd > 0 || (int64_t) batch_inp.tokens.size() > mtp_h_src.n_rows + 1)) {
         LLAMA_LOG_ERROR("%s: a device hidden-state source needs a batch of tokens only, of at most %lld rows\n",
                 __func__, (long long) mtp_h_src.n_rows + 1);
@@ -2949,6 +2989,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         mtp_h_src.row0 = n_tokens_prev;
         kv_rows_ahead  = (int64_t) n_tokens_all - n_tokens_prev - ubatch.n_tokens;
+        tokens_ahead(n_tokens_prev, ubatch);
 
         llm_graph_result * res = nullptr;
         if (stage_first) {
@@ -6305,6 +6346,10 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 bool llama_moe_cpu_counts(uint64_t * rows, uint64_t * experts, uint64_t * later) {
     return ggml_backend_moe_cache_cpu_counts(rows, experts, later);
+}
+
+void llama_tokens_ahead(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens) {
+    ctx->set_tokens_ahead(tokens, n_tokens);
 }
 
 llama_memory_report llama_get_memory_report(const struct llama_context * ctx) {

@@ -2582,6 +2582,12 @@ struct llama_model_qwen4exp : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // LLAMA_PLE_AHEAD: the PLE rows of the tokens after the running prompt ubatch, read ahead by a thread (qwen4exp.cpp)
+    struct ple_ahead;
+    static std::shared_ptr<ple_ahead> make_ple_ahead();
+    void tokens_ahead(const llama_token * tokens, int64_t n_tokens, const llama_token * prev, int64_t n_prev) const override;
+    std::shared_ptr<ple_ahead> ahead;
+
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
     protected:
