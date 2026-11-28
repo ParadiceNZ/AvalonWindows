@@ -7,8 +7,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <condition_variable>
+#include <deque>
 #include <future>
 #include <mutex>
+#include <thread>
+#include <unordered_map>
 
 // Small token batches (generation, an MTP verification): the token embedding rows gathered and dequantized by the host
 // into an f32 input instead of a get_rows node of the CPU backend (the table stays in RAM), and the PLE rows read by the
@@ -324,6 +328,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
         ahead = make_ple_ahead();
+        soon  = make_ple_soon();
     }
 
     auto load_block = [&](int il, int flags) {
@@ -2201,6 +2206,141 @@ void llama_model_qwen4exp::tokens_ahead(const llama_token * tokens, int64_t n_to
     }
 }
 
+// LLAMA_PLE_SOON=1 (off by default): generation's PLE rows fetched before their step. A step of generation (a sampled
+// token and its MTP drafts, ~60 rows) reads its rows after the launch, on the thread that then serves the GPU's layers
+// (host_task): 0.1 - 0.2 ms when the page cache holds them, ~0.9 ms on text not generated before (28 Nov, a 7800X3D and
+// an NVMe drive), during which that thread serves nothing. The caller announces each token as it is known
+// (llama_tokens_soon: the MTP draft, token by token while it drafts) and a thread reads its rows into a store of rows
+// (LLAMA_PLE_SOON_MIB, 64: ~600 000 rows of 114 bytes, the oldest replaced first), from which the step takes them: no
+// system call and no page fault for a row it holds, the others as before (and kept: an n-gram met again is served).
+// The rows are the table's bytes, so the results are the same. LLAMA_PLE_HOST_LOG=N logs the step's reads every N steps.
+// The idea of a store of rows, not of pages, and of fetching the verification's rows while the draft runs:
+// stew675/llama-cpp-rdna-boosts, wip/ple-residency (no code taken)
+struct llama_model_qwen4exp::ple_soon {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::thread worker;
+    std::deque<std::vector<int32_t>> jobs;   // rows to read
+    bool stop = false;
+
+    size_t   row_bytes = 0;
+    uint32_t cap = 0, next = 0;              // rows held at most, the slot written next
+    std::vector<char>    data;
+    std::vector<int32_t> slot_row;
+    std::unordered_map<int32_t, uint32_t> at;
+    int64_t n_hit = 0, n_miss = 0, n_read = 0;
+
+    ~ple_soon() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        cv.notify_all();
+        if (worker.joinable()) {
+            worker.join();   // it reads the model's mapping
+        }
+    }
+
+    // under the mutex
+    const char * find(int32_t row) const {
+        const auto it = at.find(row);
+        return it == at.end() ? nullptr : data.data() + (size_t) it->second * row_bytes;
+    }
+
+    void put(int32_t row, const char * bytes) {
+        if (at.count(row)) {
+            return;
+        }
+        const uint32_t s = next;
+        next = (next + 1) % cap;
+        if (slot_row[s] >= 0) {
+            at.erase(slot_row[s]);
+        }
+        slot_row[s] = row;
+        at[row] = s;
+        memcpy(data.data() + (size_t) s * row_bytes, bytes, row_bytes);
+    }
+
+    void init(const ggml_tensor * ple) {
+        const char * e = getenv("LLAMA_PLE_SOON_MIB");
+        const size_t mib = e && *e ? (size_t) std::max(1, atoi(e)) : 64;
+        row_bytes = ggml_row_size(ple->type, ple->ne[0]);
+        cap = (uint32_t) std::min<size_t>((mib << 20) / row_bytes, 1u << 28);
+        data.resize((size_t) cap * row_bytes);
+        slot_row.assign(cap, -1);
+        at.reserve(cap);
+        worker = std::thread([this, ple]() {
+            std::vector<int32_t> rows;
+            std::vector<char> buf;
+            for (;;) {
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    cv.wait(lock, [this] { return stop || !jobs.empty(); });
+                    if (stop) {
+                        return;
+                    }
+                    rows = std::move(jobs.front());
+                    jobs.pop_front();
+                    rows.erase(std::remove_if(rows.begin(), rows.end(), [this](int32_t r) { return at.count(r) != 0; }), rows.end());
+                }
+                if (rows.empty()) {
+                    continue;
+                }
+                llama_prefetch_rows(ple, rows.data(), rows.size());
+                buf.resize(rows.size() * row_bytes);
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    memcpy(buf.data() + i * row_bytes, (const char *) ple->data + (size_t) rows[i] * ple->nb[1], row_bytes);
+                }
+                std::lock_guard<std::mutex> lock(mutex);
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    put(rows[i], buf.data() + i * row_bytes);
+                }
+                n_read += (int64_t) rows.size();
+            }
+        });
+    }
+};
+
+std::shared_ptr<llama_model_qwen4exp::ple_soon> llama_model_qwen4exp::make_ple_soon() {
+    static const bool on = getenv("LLAMA_PLE_SOON") && atoi(getenv("LLAMA_PLE_SOON")) != 0;
+    return on ? std::make_shared<ple_soon>() : nullptr;
+}
+
+void llama_model_qwen4exp::tokens_soon(const llama_token * tokens, int64_t n_tokens, const llama_token * prev, int64_t n_prev) const {
+    // nothing to fetch once the table is in RAM (llama_mmap::make_resident)
+    if (!soon || n_tokens <= 0 || !per_layer_tok_embd || !per_layer_tok_embd->data || !can_prefetch.count(per_layer_tok_embd)) {
+        return;
+    }
+    const int64_t n_gram  = hparams.ple_ngram_size;
+    const int64_t n_heads = hparams.ple_n_heads;
+    const int64_t eos     = hparams.ple_eos_token_id;
+    std::vector<int32_t> idx(n_heads * n_tokens);
+    std::vector<int64_t> ctx(n_gram);
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        // as set_input(): a missing predecessor or an EOS cuts the window
+        ctx[0] = tokens[i];
+        bool cut = tokens[i] < 0;
+        for (int64_t s = 1; s < n_gram; ++s) {
+            const int64_t j = i - s;
+            const llama_token t = cut ? LLAMA_TOKEN_NULL : j >= 0 ? tokens[j] : n_prev + j >= 0 ? prev[n_prev + j] : LLAMA_TOKEN_NULL;
+            cut = cut || t < 0 || t == eos;
+            ctx[s] = cut ? eos : t;
+        }
+        if (tokens[i] < 0) {
+            return;
+        }
+        qwen4exp_ple_rows(hparams, ctx.data(), idx.data() + i * n_heads);
+    }
+    {
+        std::lock_guard<std::mutex> lock(soon->mutex);
+        if (soon->cap == 0) {
+            soon->init(per_layer_tok_embd);
+        }
+        soon->jobs.push_back(std::move(idx));
+    }
+    soon->cv.notify_one();
+}
+
 class llm_graph_input_qwen4exp_ple : public llm_graph_input_i {
 public:
     llm_graph_input_qwen4exp_ple(const llama_model & model,
@@ -2315,17 +2455,75 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_qwen4exp_ple::host_task(void * user) {
     auto * self = (llm_graph_input_qwen4exp_ple *) user;
     const ggml_tensor * ple = self->model.per_layer_tok_embd;
-    if (self->model.can_prefetch.count(ple)) {
-        llama_prefetch_rows(ple, self->host_idx.data(), self->host_idx.size());
-    }
+    // DIAGNOSTIC (LLAMA_PLE_HOST_LOG=N): the task's time and the rows the store served, a line every N calls
+    static const int log_every = getenv("LLAMA_PLE_HOST_LOG") ? atoi(getenv("LLAMA_PLE_HOST_LOG")) : 0;
+    const int64_t t_0 = log_every > 0 ? ggml_time_us() : 0;
     const auto * tt = ggml_get_type_traits(ple->type);
     const int64_t ne0 = ple->ne[0];
-    for (size_t i = 0; i < self->host_idx.size(); ++i) {
-        const char * row = (const char *) ple->data + (size_t) self->host_idx[i] * ple->nb[1];
+    const size_t n = self->host_idx.size();
+    auto to_out = [&](size_t i, const char * row) {
         if (ple->type == GGML_TYPE_F32) {
             memcpy(self->host_buf + i * ne0, row, ne0 * sizeof(float));
         } else {
             tt->to_float(row, self->host_buf + i * ne0, ne0);
+        }
+    };
+    // LLAMA_PLE_SOON: the rows the store holds (fetched while the draft ran, or read by a step before)
+    auto * soon = static_cast<const llama_model_qwen4exp &>(self->model).soon.get();
+    std::vector<int32_t> miss;
+    std::vector<size_t>  miss_i;
+    if (soon) {
+        std::lock_guard<std::mutex> lock(soon->mutex);
+        if (soon->cap > 0) {
+            for (size_t i = 0; i < n; ++i) {
+                if (const char * row = soon->find(self->host_idx[i])) {
+                    to_out(i, row);
+                    // DIAGNOSTIC (LLAMA_PLE_SOON_VERIFY=1): the row held compared with the table's
+                    static const bool verify = getenv("LLAMA_PLE_SOON_VERIFY") && atoi(getenv("LLAMA_PLE_SOON_VERIFY")) != 0;
+                    if (verify) {
+                        static int64_t n_same = 0, n_diff = 0;
+                        const bool same = memcmp(row, (const char *) ple->data + (size_t) self->host_idx[i] * ple->nb[1], soon->row_bytes) == 0;
+                        (same ? n_same : n_diff)++;
+                        if (!same || (n_same + n_diff) % 20000 == 0) {
+                            LLAMA_LOG_INFO("ple_soon verify: %lld rows held equal to the table's, %lld different\n", (long long) n_same, (long long) n_diff);
+                        }
+                    }
+                } else {
+                    miss.push_back(self->host_idx[i]);
+                    miss_i.push_back(i);
+                }
+            }
+            soon->n_hit  += (int64_t) (n - miss.size());
+            soon->n_miss += (int64_t) miss.size();
+        } else {
+            soon = nullptr;   // nothing announced yet
+        }
+    }
+    if (!soon) {
+        miss = self->host_idx;
+    }
+    if (!miss.empty() && self->model.can_prefetch.count(ple)) {
+        llama_prefetch_rows(ple, miss.data(), miss.size());
+    }
+    for (size_t k = 0; k < miss.size(); ++k) {
+        to_out(soon ? miss_i[k] : k, (const char *) ple->data + (size_t) miss[k] * ple->nb[1]);
+    }
+    if (soon && !miss.empty()) {
+        std::lock_guard<std::mutex> lock(soon->mutex);
+        for (size_t k = 0; k < miss.size(); ++k) {
+            soon->put(miss[k], (const char *) ple->data + (size_t) miss[k] * ple->nb[1]);
+        }
+    }
+    if (log_every > 0) {
+        static int64_t n_tasks = 0, rows = 0, us = 0, us_max = 0, n_300 = 0, n_1000 = 0, missed = 0;
+        const int64_t d = ggml_time_us() - t_0;
+        n_tasks++; rows += (int64_t) n; us += d; us_max = std::max(us_max, d); missed += soon ? (int64_t) miss.size() : 0;
+        n_300 += d >= 300; n_1000 += d >= 1000;
+        if (n_tasks % log_every == 0) {
+            LLAMA_LOG_INFO("ple_host: %lld tasks, %.1f rows each, %.0f us each (max %lld), %lld of 0.3 ms or more, %lld of 1 ms; store: %s, %.1f rows a task not held\n",
+                    (long long) n_tasks, (double) rows / n_tasks, (double) us / n_tasks, (long long) us_max, (long long) n_300, (long long) n_1000,
+                    soon ? "on" : "off", (double) missed / n_tasks);
+            n_tasks = rows = us = us_max = n_300 = n_1000 = missed = 0;
         }
     }
 }

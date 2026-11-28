@@ -6352,6 +6352,11 @@ void llama_tokens_ahead(struct llama_context * ctx, const llama_token * tokens, 
     ctx->set_tokens_ahead(tokens, n_tokens);
 }
 
+void llama_tokens_soon(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens,
+                       const llama_token * prev, int32_t n_prev) {
+    ctx->get_model().tokens_soon(tokens, n_tokens, prev, n_prev);
+}
+
 llama_memory_report llama_get_memory_report(const struct llama_context * ctx) {
     return ctx->memory_report();
 }
