@@ -1434,6 +1434,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    std::vector<llama_tokens> soon_prev;   // LLAMA_PLE_SOON: per seq, the tokens before the next one announced
+
     std::vector<bool> kv_hash_due;   // LLAMA_MTP_KV_HASH: a prompt batch was processed since the last draft
 
     // DIAGNOSTIC LLAMA_MTP_STATS=file: one line per verified draft, "n_draft n_accepted step_ms" then each draft token's
@@ -1610,6 +1612,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
         i_last.assign(n_seq, -1);
+        soon_prev.assign(n_seq, {});
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
 
@@ -2103,6 +2106,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
             batch.set_embd(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
 
+            // LLAMA_PLE_SOON: the verification decodes id_last and the drafts: each announced as soon as it is known
+            soon_prev[seq_id].clear();
+            if (dp.prompt) {
+                const size_t n_tail = std::min<size_t>(dp.prompt->size(), 16);
+                soon_prev[seq_id].assign(dp.prompt->end() - n_tail, dp.prompt->end());
+            }
+            llama_tokens_soon(params.ctx_tgt, &dp.id_last, 1, soon_prev[seq_id].data(), (int32_t) soon_prev[seq_id].size());
+            soon_prev[seq_id].push_back(dp.id_last);
+
             i_last[seq_id] = idx;
 
             if (chain_heads) {
@@ -2209,6 +2221,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 result.push_back(id);
+
+                llama_tokens_soon(params.ctx_tgt, &id, 1, soon_prev[seq_id].data(), (int32_t) soon_prev[seq_id].size());
+                soon_prev[seq_id].push_back(id);
 
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);

@@ -131,6 +131,12 @@ LLAMA_API bool llama_moe_cpu_counts(uint64_t * rows, uint64_t * experts, uint64_
 // the results.
 LLAMA_API void llama_tokens_ahead(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens);
 
+// A hint: tokens the caller decodes soon in a small batch (a sampled token, a draft's tokens as they are drafted), and
+// the n_prev tokens before them, oldest first. With LLAMA_PLE_SOON=1 the model fetches now what it gathers for them from
+// the disk (qwen4exp's PLE rows), on a thread. No effect on the results.
+LLAMA_API void llama_tokens_soon(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens,
+                                 const llama_token * prev, int32_t n_prev);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

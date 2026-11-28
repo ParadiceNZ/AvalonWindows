@@ -2588,6 +2588,12 @@ struct llama_model_qwen4exp : public llama_model_base {
     void tokens_ahead(const llama_token * tokens, int64_t n_tokens, const llama_token * prev, int64_t n_prev) const override;
     std::shared_ptr<ple_ahead> ahead;
 
+    // LLAMA_PLE_SOON: generation's PLE rows fetched by a thread as their tokens are announced, in a store of rows
+    struct ple_soon;
+    static std::shared_ptr<ple_soon> make_ple_soon();
+    void tokens_soon(const llama_token * tokens, int64_t n_tokens, const llama_token * prev, int64_t n_prev) const override;
+    std::shared_ptr<ple_soon> soon;
+
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
     protected:

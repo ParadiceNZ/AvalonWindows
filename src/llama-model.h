@@ -816,6 +816,12 @@ struct llama_model {
         GGML_UNUSED(tokens); GGML_UNUSED(n_tokens); GGML_UNUSED(prev); GGML_UNUSED(n_prev);
     }
 
+    // a hint: tokens a small batch decodes soon (a step of generation), prev the ones before them, oldest first; a model
+    // may fetch now what it gathers for them from the disk (qwen4exp's PLE rows). Any thread. No effect on the results
+    virtual void tokens_soon(const llama_token * tokens, int64_t n_tokens, const llama_token * prev, int64_t n_prev) const {
+        GGML_UNUSED(tokens); GGML_UNUSED(n_tokens); GGML_UNUSED(prev); GGML_UNUSED(n_prev);
+    }
+
 protected:
     llama_model_params params;
 
